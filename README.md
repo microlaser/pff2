@@ -1,196 +1,121 @@
-# secure_mac_dns
+# pff2
 
-Encrypts all DNS queries on macOS using DNS-over-TLS (DoT) via [Quad9](https://quad9.net), and locks the firewall so plaintext DNS cannot leak from any application.
+Extreme hardening ruleset for the macOS `pf` firewall. Blocks all IPv6, all mDNS, and all unsolicited inbound traffic. The machine produces no RST or ICMP unreachable replies — it is invisible on the network.
 
----
-
-## Why this exists
-
-By default, macOS sends DNS queries in plaintext UDP. Every query — every domain you visit — is visible to your ISP, router, and anyone on the local network. This script replaces that with an encrypted chain that your ISP cannot read and your router cannot intercept.
-
-It is also a **required dependency** for the hardened `pf` firewall ruleset in this repo. The firewall blocks port 53 externally and only opens port 853 (DoT). Without this DNS stack running, the firewall will break name resolution entirely.
+**This ruleset will break DNS if you run it alone.** It requires the encrypted DNS stack described below.
 
 ---
 
-## How it works
+## Prerequisite: encrypted DNS
 
-```
-Your apps
-    │
-    ▼
-macOS resolver
-    │  port 53 (loopback only — never leaves the machine)
-    ▼
-dnsmasq @ 127.0.0.1:53
-    │  forwards to stubby on localhost
-    ▼
-stubby @ 127.0.0.1:5300
-    │  TLS-encrypted, port 853
-    ▼
-Quad9 @ 9.9.9.9 / 149.112.112.112
+`pfctl2.sh` opens port 853 (DNS-over-TLS) and blocks port 53 externally. This is intentional — plaintext DNS never leaves the machine. But it means your system DNS must be routed through a local DoT proxy, or name resolution will fail entirely.
+
+Install the DNS stack first:
+
+```bash
+git clone https://github.com/microlaser/secure_mac_dns
+cd secure_mac_dns
+sudo bash setup_dns_privacy.sh
 ```
 
-**dnsmasq** sits on the standard port 53 so macOS and every application work without any configuration changes. It does no resolution itself — it just bridges queries to stubby.
+That script installs and configures:
 
-**stubby** is a DNS-over-TLS stub resolver. It opens a persistent TLS connection to Quad9 on port 853, authenticates the server certificate (`dns.quad9.net`), and never falls back to plaintext. Query padding is enabled to reduce fingerprinting.
+- **stubby** — DNS-over-TLS daemon, listens on `127.0.0.1:5300`, connects to Quad9 (`9.9.9.9`) on port 853 with TLS certificate verification. Never falls back to plaintext.
+- **dnsmasq** — bridges macOS system DNS (port 53, loopback only) to stubby on port 5300
+- **LaunchDaemons** for both, so they survive reboots
+- **Interface lock** — every network adapter set to `127.0.0.1` as its resolver so DHCP cannot override it
 
-**Quad9** is a non-profit resolver that does not log or sell query data, and filters known malicious domains. Both the primary (`9.9.9.9`) and secondary (`149.112.112.112`) servers are configured for failover.
+The full chain once configured:
 
----
+```
+Any app → dnsmasq @ 127.0.0.1:53 → stubby @ 127.0.0.1:5300 → Quad9 @ 9.9.9.9:853 (TLS)
+```
 
-## Relationship to the pf firewall ruleset
+Both dnsmasq and stubby live on loopback. The `pf` ruleset skips loopback entirely (`set skip on lo0`), so port 53 traffic never touches the firewall. The only external DNS traffic is stubby's outbound TLS connection on port 853, which the ruleset explicitly passes.
 
-The hardened `pfctl.sh` firewall in this repo is built around this DNS stack. The two are designed to work together:
+Verify the DNS stack is working before applying the firewall:
 
-| What the firewall does | Why |
-|---|---|
-| `set skip on lo0` | Loopback is unfiltered — dnsmasq and stubby communicate on `127.0.0.1` without pf interference |
-| `block quick inet6 all` | All IPv6 dropped; DNS stack is IPv4-only |
-| `block quick inet proto { tcp udp } to/from port 5353` | mDNS/Bonjour blocked in both directions |
-| `pass out quick inet proto tcp to any port 853 keep state` | Stubby's outbound DoT connection to Quad9 — the **only** external DNS traffic |
-| No `port 53` outbound rule | Intentional. Port 53 never leaves the machine. Anything trying to bypass the stack is silently dropped. |
+```bash
+# Stubby resolving directly
+dig +short google.com @127.0.0.1 -p 5300
 
-If you run `pfctl.sh` without this DNS stack active, all name resolution will fail because:
-- Port 53 outbound is blocked at the firewall
-- Port 853 outbound is open, but nothing will be listening to use it
+# Full chain through dnsmasq
+dig +short google.com @127.0.0.1
 
-Run `setup_dns_privacy.sh` first, verify it passes all checks, then apply `pfctl.sh`.
+# Quad9 confirmed as upstream
+dig +short id.server.on.quad9.net txt @127.0.0.1 -p 5300
+
+# Port 853 reachable
+nc -z -w 4 9.9.9.9 853 && echo "open" || echo "BLOCKED"
+```
+
+All four must pass before proceeding.
 
 ---
 
 ## Installation
 
 ```bash
-sudo bash setup_dns_privacy.sh
+sudo bash pfctl2.sh
 ```
 
-Requires macOS. Works on both Apple Silicon and Intel. Safe to run more than once — every step is idempotent.
-
-The script will:
-
-1. Install Homebrew if not present
-2. Install and configure **stubby** (DoT daemon)
-3. Install and configure **dnsmasq** (local DNS bridge)
-4. Start both services via LaunchDaemons (survives reboots)
-5. Lock every network interface to `127.0.0.1` as its DNS server
-6. Install a pf anchor that blocks plaintext DNS leaks on port 53
-7. Run a full verification suite
+The script backs up your existing `/etc/pf.conf` with a timestamp before writing anything. If the DNS connectivity test fails after loading, it automatically disables pf and restores the backup.
 
 ---
 
-## Verification
+## What the ruleset does
 
-The script runs these checks automatically at the end. You can re-run them manually at any time:
-
-```bash
-# Is the system resolver pointing to localhost?
-scutil --dns | grep nameserver
-
-# Is stubby resolving queries directly?
-dig +short google.com @127.0.0.1 -p 5300
-
-# Is dnsmasq bridging correctly?
-dig +short google.com @127.0.0.1
-
-# Is Quad9 confirmed as upstream?
-dig +short id.server.on.quad9.net txt @127.0.0.1 -p 5300
-
-# Is port 853 reachable outbound?
-nc -z -w 4 9.9.9.9 853 && echo "open" || echo "blocked"
-
-# Is plaintext DNS leaking? (watch for 5 seconds)
-sudo tcpdump -i any -nn udp port 53 or tcp port 53 &
-sleep 5 && sudo kill %1
-# Any line NOT from 127.0.0.1 is a leak
+```
+set block-policy drop       # No RST or ICMP unreachable — machine is invisible
+set skip on lo0             # Loopback unfiltered (dnsmasq/stubby live here)
+anchor "com.apple/*"        # Preserve macOS system rules
+block all                   # Default deny
+block quick inet6 all       # All IPv6 dropped
+block quick ... port 5353   # mDNS/Bonjour blocked both directions
+pass out ... port 853       # DNS-over-TLS to Quad9 (stubby's only external port)
+pass out ... port 123       # NTP
+pass out ... port 80/443    # HTTP/HTTPS
+pass out ... icmp            # Outbound ping/traceroute
+pass in  ... keep state     # Return traffic for established sessions only
 ```
 
----
-
-## What gets installed
-
-| Component | Location |
-|---|---|
-| stubby config | `/opt/homebrew/etc/stubby/stubby.yml` |
-| dnsmasq config | `/opt/homebrew/etc/dnsmasq.conf` |
-| stubby LaunchDaemon | `/Library/LaunchDaemons/homebrew.mxcl.stubby.plist` |
-| dnsmasq LaunchDaemon | `/Library/LaunchDaemons/homebrew.mxcl.dnsmasq.plist` |
-| pf anchor rules | `/etc/pf.anchors/dns_privacy` |
-| pf reload daemon | `/Library/LaunchDaemons/com.dns-privacy.pf-anchor.plist` |
-| Backups | `/var/backups/dns_privacy_<timestamp>/` |
+Nothing reaches the machine unsolicited. There are no open inbound ports. The `pass in` rules only admit packets that match an existing outbound state table entry.
 
 ---
 
 ## Troubleshooting
 
-**stubby won't start**
+**DNS broken after running pfctl2.sh**
+
+The DNS stack is not running. Check:
+
 ```bash
-cat /var/log/stubby_err.log
+pgrep -x stubby  && echo "OK" || echo "stubby not running"
+pgrep -x dnsmasq && echo "OK" || echo "dnsmasq not running"
 ```
 
-**dnsmasq won't start**
+If either is down, re-run `setup_dns_privacy.sh` from the [secure_mac_dns](https://github.com/microlaser/secure_mac_dns) repo.
+
+**Networking broken, need to recover**
+
 ```bash
-cat /var/log/dnsmasq_err.log
+sudo pfctl -d                          # Disable pf immediately
+sudo pfctl -f /etc/pf.conf             # Reload after fixing
 ```
 
-**DNS broken after applying pfctl.sh**
+**Verify active ruleset**
+
 ```bash
-# Confirm the DNS stack is running before enabling the firewall
-pgrep -x stubby  && echo "stubby OK"  || echo "stubby NOT running"
-pgrep -x dnsmasq && echo "dnsmasq OK" || echo "dnsmasq NOT running"
-
-# Reload the firewall
-sudo pfctl -f /etc/pf.conf
-
-# Confirm port 853 is passing
-sudo pfctl -sr | grep 853
-```
-
-**Name resolution fails with pf enabled but DNS stack is running**
-```bash
-# Check that stubby is actually reaching Quad9 on port 853
-nc -z -w 4 9.9.9.9 853 && echo "853 open" || echo "853 BLOCKED by pf"
-
-# If blocked, verify pfctl.sh has the port 853 pass rule loaded
-sudo pfctl -sr | grep "port = 853"
-```
-
-**Revert everything**
-```bash
-# Stop services
-sudo launchctl unload /Library/LaunchDaemons/homebrew.mxcl.stubby.plist
-sudo launchctl unload /Library/LaunchDaemons/homebrew.mxcl.dnsmasq.plist
-
-# Restore pf.conf from backup
-sudo cp /var/backups/dns_privacy_<timestamp>/pf.conf /etc/pf.conf
-sudo pfctl -f /etc/pf.conf
-
-# Reset network interfaces to DHCP DNS
-sudo networksetup -setdnsservers "Wi-Fi" "Empty"
+sudo pfctl -sr
 ```
 
 ---
 
-## Privacy properties
+## Related projects
 
-| Property | Status |
-|---|---|
-| Queries encrypted in transit | ✓ TLS 1.3 to Quad9 |
-| Resolver authenticates server cert | ✓ `tls_auth_name: dns.quad9.net` |
-| Falls back to plaintext | ✗ Never (`GETDNS_AUTHENTICATION_REQUIRED`) |
-| Query padding | ✓ 128-byte blocks (reduces fingerprinting) |
-| EDNS Client Subnet | ✗ Disabled (`edns_client_subnet_private: 1`) |
-| Resolver logs queries | ✗ Quad9 privacy policy: no query logging |
-| Plaintext DNS blocked at firewall | ✓ port 53 outbound blocked externally |
-| mDNS/Bonjour blocked | ✓ port 5353 blocked in both directions |
-| IPv6 DNS exposure | ✗ IPv6 fully blocked at firewall |
-
----
-
-## Related tools
-
-This script is part of a broader security stack:
-
-- [`pfctl.sh`](pfctl.sh) — hardened pf firewall ruleset (requires this DNS stack)
-- [`net_exploit_detector.py`](https://github.com/microlaser/net_exploit_detector) — network anomaly detector
-- [`wifi-guardian`](https://github.com/microlaser/wifi-guardian) — evil twin AP detector
-- [`apt_detector_improved`](https://github.com/microlaser/apt_detector_improved) — macOS APT/malware detector
+- [secure_mac_dns](https://github.com/microlaser/secure_mac_dns) — DNS-over-TLS stack (required dependency)
+- [apt_detector_improved](https://github.com/microlaser/apt_detector_improved) — C-based APT/malware detector for macOS
+- [apt_detector_linux](https://github.com/microlaser/apt_detector_linux) — Python malware scanner for Linux (aarch64/x86-64)
+- [Standalone_WiFi_Scanner](https://github.com/microlaser/Standalone_WiFi_Scanner) — command-line Wi-Fi scanner for Linux, no NetworkManager dependency
+- [wifi-guardian](https://github.com/microlaser/wifi-guardian) — evil twin AP detector for macOS (CoreWLAN) and Windows (netsh)
+- [net_exploit_detector](https://github.com/microlaser/net_exploit_detector) — zero-dependency Python network anomaly detector using tcpdump
